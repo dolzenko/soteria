@@ -50,6 +50,9 @@ impl AsyncComponent for App {
             connect_show[password_entry] => move |_| {
                 password_entry.grab_focus();
             },
+            connect_hide[password_entry] => move |_| {
+                password_entry.set_text("");
+            },
             connect_close_request[cancel_button] => move |_| {
                 cancel_button.emit_clicked();
                 gtk4::glib::Propagation::Proceed

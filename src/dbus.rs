@@ -4,7 +4,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     process,
-    sync::mpsc,
+    sync::{Mutex, mpsc, oneshot},
 };
 use zbus::{interface, zvariant::Value};
 
@@ -18,7 +18,8 @@ use crate::{
 pub struct AuthenticationAgent {
     config: SystemConfig,
     sender: mpsc::Sender<AuthenticationAgentEvent>,
-    receiver: mpsc::Receiver<AuthenticationUserEvent>,
+    receiver: Mutex<mpsc::Receiver<AuthenticationUserEvent>>,
+    cancellations: Mutex<HashMap<String, oneshot::Sender<()>>>,
 }
 
 impl AuthenticationAgent {
@@ -29,36 +30,20 @@ impl AuthenticationAgent {
     ) -> Self {
         Self {
             sender,
-            receiver,
+            receiver: Mutex::new(receiver),
+            cancellations: Mutex::new(HashMap::new()),
             config,
         }
     }
-}
 
-#[interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
-impl AuthenticationAgent {
-    async fn cancel_authentication(&self, cookie: &str) {
-        tracing::debug!("received request to cancel authentication for {}", cookie);
-        self.sender
-            .send(AuthenticationAgentEvent::Canceled {
-                cookie: cookie.to_owned(),
-            })
-            .await
-            .unwrap();
-    }
-
-    async fn begin_authentication(
-        &mut self,
-        action_id: &str,
+    async fn authenticate(
+        &self,
         message: &str,
-        icon_name: &str,
-        details: HashMap<String, String>,
         cookie: &str,
         identities: Vec<Identity<'_>>,
     ) -> Result<()> {
-        tracing::info!("received request to authenticate");
-        tracing::debug!(action_id = action_id, message = message, icon_name = icon_name, details = ?details, cookie = cookie, identities = ?identities);
-
+        // Сериализуем только диалоги; D-Bus отмена не берёт этот lock.
+        let mut receiver = self.receiver.lock().await;
         let mut names: Vec<String> = Vec::new();
         for identity in identities.iter() {
             let details = identity.get_details();
@@ -84,7 +69,7 @@ impl AuthenticationAgent {
             .map_err(|_| PolkitError::Failed("Failed to send data.".to_string()))?;
 
         loop {
-            match &self.receiver.recv().await.ok_or_else(|| {
+            match &receiver.recv().await.ok_or_else(|| {
                 PolkitError::Failed("Failed to receive data. channel closed".to_string())
             })? {
                 AuthenticationUserEvent::Canceled { cookie: c } => {
@@ -102,6 +87,7 @@ impl AuthenticationAgent {
                     if c == cookie {
                         let mut stream = UnixStream::connect(self.config.get_socket_path()).await;
 
+                        let mut child;
                         let (reader, mut writer): (
                             BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
                             Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
@@ -115,11 +101,12 @@ impl AuthenticationAgent {
 
                             (BufReader::new(Box::new(read_half)), Box::new(write_half))
                         } else {
-                            let mut child = process::Command::new(self.config.get_helper_path())
+                            child = process::Command::new(self.config.get_helper_path())
                                 .arg(user)
                                 .env("LC_ALL", "C")
                                 .stdin(Stdio::piped())
                                 .stdout(Stdio::piped())
+                                .kill_on_drop(true)
                                 .spawn()
                                 .map_err(|_| {
                                     PolkitError::Failed(
@@ -200,3 +187,52 @@ impl AuthenticationAgent {
         }
     }
 }
+
+#[interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
+impl AuthenticationAgent {
+    async fn cancel_authentication(&self, cookie: &str) -> Result<()> {
+        tracing::debug!("received request to cancel authentication for {}", cookie);
+        // Закрытие старого диалога должно попасть в UI раньше запуска следующего.
+        let notification = self
+            .sender
+            .send(AuthenticationAgentEvent::Canceled {
+                cookie: cookie.to_owned(),
+            })
+            .await;
+        if let Some(cancel) = self.cancellations.lock().await.remove(cookie) {
+            if cancel.send(()).is_err() {
+                tracing::debug!("authentication already finished before cancellation");
+            }
+        }
+        notification.map_err(|_| PolkitError::Failed("Failed to send data.".to_string()))
+    }
+
+    async fn begin_authentication(
+        &self,
+        action_id: &str,
+        message: &str,
+        icon_name: &str,
+        details: HashMap<String, String>,
+        cookie: &str,
+        identities: Vec<Identity<'_>>,
+    ) -> Result<()> {
+        tracing::info!("received request to authenticate");
+        tracing::debug!(action_id = action_id, message = message, icon_name = icon_name, details = ?details, cookie = cookie, identities = ?identities);
+
+        let (cancel, cancelled) = oneshot::channel();
+        self.cancellations
+            .lock()
+            .await
+            .insert(cookie.to_owned(), cancel);
+        let result = tokio::select! {
+            biased;
+            _ = cancelled => Err(PolkitError::Cancelled("Authentication was cancelled.".to_string())),
+            result = self.authenticate(message, cookie, identities) => result,
+        };
+        self.cancellations.lock().await.remove(cookie);
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests;
